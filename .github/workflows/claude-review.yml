@@ -1,6 +1,7 @@
 # Reusable workflow: automated code review using Claude.
 #
-# The caller owns the triggers, the event filter, concurrency and the permissions grant.
+# Each repository's caller workflow sets the triggers (on:) and grants the token permissions.
+# This workflow filters those events and runs at most one review per PR at a time.
 name: Claude Code Review
 
 on:
@@ -30,41 +31,114 @@ on:
 permissions: {}
 
 jobs:
-  review:
+  # Runs that are filtered out here never reach the review job or its concurrency group.
+  gate:
+    if: |
+      (
+        github.event_name == 'pull_request' &&
+        github.event.pull_request.draft == false &&
+        github.event.pull_request.head.repo.full_name == github.repository &&
+        github.event.pull_request.user.type != 'Bot'
+      ) || (
+        github.event_name == 'issue_comment' &&
+        github.event.issue.pull_request != null &&
+        contains(github.event.comment.body, '@claude') &&
+        github.event.comment.user.type != 'Bot'
+      )
     runs-on: ubuntu-latest
+    permissions:
+      pull-requests: read
+    outputs:
+      pr-number: ${{ steps.check.outputs.pr-number }}
+      run: ${{ steps.check.outputs.run }}
+    steps:
+      - name: Check the PR and who triggered the review
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          EVENT_NAME: ${{ github.event_name }}
+          PR_NUMBER: ${{ github.event.pull_request.number || github.event.issue.number }}
+          ACTOR: ${{ github.actor }}
+        run: |
+          set -euo pipefail
+          echo "pr-number=$PR_NUMBER" >> "$GITHUB_OUTPUT"
+          # Written first, so a failed lookup below leaves the review skipped
+          echo "run=false" >> "$GITHUB_OUTPUT"
+
+          # GET with up to three attempts. Prints the jq result, or fails after the last attempt.
+          api() {
+            local out
+            for attempt in 1 2 3; do
+              if out=$(gh api "$1" --jq "$2"); then
+                printf '%s\n' "$out"
+                return 0
+              fi
+              sleep $((attempt * 5))
+            done
+            return 1
+          }
+
+          case "$EVENT_NAME" in
+            pull_request)
+              # PRs from other repositories are filtered out by the job condition
+              ;;
+            issue_comment)
+              # issue_comment runs get secrets even on fork PRs, so look the PR up
+              HEAD_REPO=$(api "repos/$REPO/pulls/$PR_NUMBER" '.head.repo.full_name // ""') \
+                || { echo "::error::Could not look up PR #$PR_NUMBER."; exit 1; }
+              if [[ "$HEAD_REPO" != "$REPO" ]]; then
+                echo "PR #$PR_NUMBER comes from '$HEAD_REPO', not $REPO. Skipping the review."
+                exit 0
+              fi
+              ;;
+            *)
+              echo "Unexpected event '$EVENT_NAME'. Skipping the review."
+              exit 0
+              ;;
+          esac
+
+          # claude-code-action rejects users without write access too, but only after this
+          # run has collapsed the previous review
+          PERMISSION=$(api "repos/$REPO/collaborators/$ACTOR/permission" '.permission') \
+            || { echo "::error::Could not look up $ACTOR's permission on $REPO."; exit 1; }
+          if [[ "$PERMISSION" != "admin" && "$PERMISSION" != "write" ]]; then
+            echo "$ACTOR has '$PERMISSION' access to $REPO, not write. Skipping the review."
+            exit 0
+          fi
+          echo "run=true" >> "$GITHUB_OUTPUT"
+
+  review:
+    needs: gate
+    if: needs.gate.outputs.run == 'true'
+    runs-on: ubuntu-latest
+    # One review per PR at a time. A new request waits for the running one instead of
+    # cancelling it, because a cancelled run can leave a half-posted review behind. The
+    # prefix keeps this group distinct from any group a caller declares, which would deadlock.
+    concurrency:
+      group: mozdata-actions-claude-review-${{ needs.gate.outputs.pr-number }}
+      cancel-in-progress: false
     permissions:
       contents: read
       pull-requests: write
     env:
+      PR_NUMBER: ${{ needs.gate.outputs.pr-number }}
       # Used when the caller passes no review-instructions. CLAUDE.md is not listed because
       # Claude Code loads it automatically.
       DEFAULT_INSTRUCTIONS: |-
         If the repository has an AGENTS.md at its root, read it for conventions before reviewing.
     steps:
-      - name: Check PR is not from a fork
-        if: github.event_name == 'issue_comment'
-        id: fork-check
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          # Fail closed: on any API error or unexpected result, default to 'true' (treat as a
-          # fork) so the secret-bearing steps below run only on a confirmed non-fork.
-          IS_FORK=$(gh api repos/${{ github.repository }}/pulls/${{ github.event.issue.number }} --jq '.head.repo.fork' || echo 'true')
-          echo "is_fork=${IS_FORK:-true}" >> "$GITHUB_OUTPUT"
-
       - name: Checkout repository
-        if: github.event_name == 'pull_request' || steps.fork-check.outputs.is_fork == 'false'
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           # issue_comment defaults to the default branch, so check out the PR head instead
-          ref: ${{ github.event_name == 'issue_comment' && format('refs/pull/{0}/head', github.event.issue.number) || github.ref }}
+          ref: ${{ github.event_name == 'issue_comment' && format('refs/pull/{0}/head', needs.gate.outputs.pr-number) || github.ref }}
           fetch-depth: 1
           persist-credentials: false
 
       - name: Clone sibling repository (review conventions live there)
         id: clone
-        if: inputs.clone-repo != '' && (github.event_name == 'pull_request' || steps.fork-check.outputs.is_fork == 'false')
+        if: inputs.clone-repo != ''
         env:
           CLONE_REPO: ${{ inputs.clone-repo }}
         run: |
@@ -80,12 +154,10 @@ jobs:
           echo "dir=$DIR" >> "$GITHUB_OUTPUT"
 
       - name: Minimize previous Claude reviews
-        if: github.event_name == 'pull_request' || steps.fork-check.outputs.is_fork == 'false'
         env:
           GH_TOKEN: ${{ github.token }}
           REPO_OWNER: ${{ github.repository_owner }}
           REPO_NAME: ${{ github.event.repository.name }}
-          PR_NUMBER: ${{ github.event.pull_request.number || github.event.issue.number }}
         run: |
           set -euo pipefail
           # Filter on the `<!-- claude-review -->` marker that the prompt asks Claude to embed
@@ -123,7 +195,6 @@ jobs:
           done
 
       - name: Unset runner tokens before agent step
-        if: github.event_name == 'pull_request' || steps.fork-check.outputs.is_fork == 'false'
         # Prevents a prompt injection in the agent step below from using these to touch the Actions
         # cache/artifacts API or mint an OIDC token.
         run: |
@@ -132,7 +203,8 @@ jobs:
           echo "ACTIONS_ID_TOKEN_REQUEST_URL=" >> "$GITHUB_ENV"
 
       - name: Run Claude Code Review
-        if: github.event_name == 'pull_request' || steps.fork-check.outputs.is_fork == 'false'
+        # Typical reviews take a few minutes. Without this, a hang runs until the 6-hour job limit.
+        timeout-minutes: 20
         # Mozilla org allowlist permits either "anthropics/claude-code-action@v1" (mutable tag)
         # or a specific older SHA (73367208d0bc0c529b8b3fb223cbd4a8f63586e4, between v1.0.66 and v1.0.67).
         # Using @v1 to stay current.
@@ -146,7 +218,7 @@ jobs:
           include_fix_links: false
           prompt: |
             REPO: ${{ github.repository }}
-            PR NUMBER: ${{ github.event.pull_request.number || github.event.issue.number }}
+            PR NUMBER: ${{ needs.gate.outputs.pr-number }}
 
             Review this pull request for code quality, best practices, and potential issues.
             ${{ inputs.review-instructions || env.DEFAULT_INSTRUCTIONS }}
@@ -174,8 +246,11 @@ jobs:
                  string `<!-- claude-review -->` in this body. It's a hidden HTML comment used to auto-collapse this review on rerun.
 
             If any of those tools fail, fall back to posting a single consolidated top-level comment via `gh pr comment` so the run isn't silent.
+          # The action defaults to auto mode, which can approve tool calls outside --allowedTools.
+          # Default mode denies them, so the list below stays strict.
           claude_args: |
             ${{ steps.clone.outputs.dir && format('--add-dir {0}', steps.clone.outputs.dir) || '' }}
+            --permission-mode default
             --max-budget-usd ${{ inputs.max-budget-usd }}
             --allowedTools mcp__github__create_pending_pull_request_review,mcp__github__add_comment_to_pending_review
             --allowedTools mcp__github_inline_comment__create_inline_comment
@@ -186,7 +261,7 @@ jobs:
             --allowedTools "Bash(gh pr diff:*),Bash(gh pr view:*),Bash(gh pr comment:*),Read,Grep,Glob"
 
       - name: Log Claude permission denials
-        if: ${{ always() && (github.event_name == 'pull_request' || steps.fork-check.outputs.is_fork == 'false') }}
+        if: always()
         env:
           LOG: ${{ runner.temp }}/claude-execution-output.json
         run: |

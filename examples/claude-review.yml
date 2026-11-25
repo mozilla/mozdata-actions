@@ -11,28 +11,12 @@ on:
   issue_comment:
     types: [created]
 
-concurrency:
-  group: claude-review-${{ github.event.pull_request.number || github.event.issue.number }}-${{ github.event_name }}
-  cancel-in-progress: true
-
 jobs:
   review:
-    if: |
-      (
-        github.event_name == 'pull_request' &&
-        github.event.pull_request.draft == false &&
-        github.event.pull_request.head.repo.fork != true &&
-        github.event.pull_request.user.type != 'Bot'
-      ) || (
-        github.event_name == 'issue_comment' &&
-        github.event.issue.pull_request != null &&
-        contains(github.event.comment.body, '@claude') &&
-        github.event.comment.user.type != 'Bot'
-      )
     permissions:
       contents: read
       pull-requests: write
-    uses: mozilla/mozdata-actions/.github/workflows/claude-review.yml@07c02abca74440b1b902d4684aa7b99b3684c4ee # v0.1.0
+    uses: mozilla/mozdata-actions/.github/workflows/claude-review.yml@<commit-sha> # <version>
     secrets:
       ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
     with:

@@ -10,7 +10,15 @@ Reviews pull requests with [Claude Code](https://claude.ai/code) through
 ### Usage
 
 Copy [`examples/claude-review.yml`](examples/claude-review.yml) to `.github/workflows/` in a target
-repository and add an `ANTHROPIC_API_KEY` secret.
+repository and add an `ANTHROPIC_API_KEY` secret. Replace `<commit-sha>` and `<version>` with the
+latest release, for example:
+
+```bash
+gh api repos/mozilla/mozdata-actions/commits/v0.2.0 --jq .sha
+```
+
+The caller only sets the triggers and permissions. Don't add an `if:` filter or `concurrency:` to it;
+this workflow handles both.
 
 ### Inputs
 
