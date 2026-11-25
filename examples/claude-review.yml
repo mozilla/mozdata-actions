@@ -33,7 +33,7 @@ jobs:
       contents: read
       pull-requests: write
     # Pin to a commit SHA; zizmor flags branch refs like @main
-    uses: mozilla/mozdata-actions/.github/workflows/claude-review.yml@main
+    uses: mozilla/mozdata-actions/.github/workflows/claude-review.yml@ac0c5804cbf8a6a43bba1bed1bd535521c43e24f
     secrets:
       ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
     with:
