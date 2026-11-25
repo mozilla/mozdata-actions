@@ -1,0 +1,42 @@
+# Automated code review using Claude
+# Triggers:
+#   - Once automatically when a PR is opened or marked ready for review
+#   - On demand by commenting "@claude" on a PR (non-fork PRs only)
+name: Claude Code Review
+
+on:
+  pull_request:
+    types: [opened, ready_for_review]
+
+  issue_comment:
+    types: [created]
+
+concurrency:
+  group: claude-review-${{ github.event.pull_request.number || github.event.issue.number }}-${{ github.event_name }}
+  cancel-in-progress: true
+
+jobs:
+  review:
+    if: |
+      (
+        github.event_name == 'pull_request' &&
+        github.event.pull_request.draft == false &&
+        github.event.pull_request.head.repo.fork != true &&
+        github.event.pull_request.user.type != 'Bot'
+      ) || (
+        github.event_name == 'issue_comment' &&
+        github.event.issue.pull_request != null &&
+        contains(github.event.comment.body, '@claude') &&
+        github.event.comment.user.type != 'Bot'
+      )
+    permissions:
+      contents: read
+      pull-requests: write
+    # Pin to a commit SHA; zizmor flags branch refs like @main
+    uses: mozilla/mozdata-actions/.github/workflows/claude-review.yml@main
+    secrets:
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+    with:
+      # Optional: point Claude at the docs that hold repository conventions
+      review-instructions: |-
+        Refer to CONTRIBUTING.md for conventions and best practices.
